@@ -30,6 +30,7 @@ from sqlalchemy import (
     select,
     and_,
     desc,
+    text,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -81,7 +82,23 @@ class StockDaily(Base):
     ma5 = Column(Float)
     ma10 = Column(Float)
     ma20 = Column(Float)
+    ma60 = Column(Float)
+    ma120 = Column(Float)
+    ma250 = Column(Float)
     volume_ratio = Column(Float)  # 量比
+    rsi = Column(Float)
+    macd_dif = Column(Float)
+    macd_dea = Column(Float)
+    macd_hist = Column(Float)
+    kdj_k = Column(Float)
+    kdj_d = Column(Float)
+    kdj_j = Column(Float)
+    boll_upper = Column(Float)
+    boll_mid = Column(Float)
+    boll_lower = Column(Float)
+    atr = Column(Float)
+    obv = Column(Float)
+    cci = Column(Float)
     
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
@@ -114,9 +131,109 @@ class StockDaily(Base):
             'ma5': self.ma5,
             'ma10': self.ma10,
             'ma20': self.ma20,
+            'ma60': self.ma60,
+            'ma120': self.ma120,
+            'ma250': self.ma250,
             'volume_ratio': self.volume_ratio,
+            'rsi': self.rsi,
+            'macd_dif': self.macd_dif,
+            'macd_dea': self.macd_dea,
+            'macd_hist': self.macd_hist,
+            'kdj_k': self.kdj_k,
+            'kdj_d': self.kdj_d,
+            'kdj_j': self.kdj_j,
+            'boll_upper': self.boll_upper,
+            'boll_mid': self.boll_mid,
+            'boll_lower': self.boll_lower,
+            'atr': self.atr,
+            'obv': self.obv,
+            'cci': self.cci,
             'data_source': self.data_source,
         }
+
+
+class Position(Base):
+    """
+    用户持仓数据模型
+    
+    记录单一账户的持仓成本与数量，用于个性化分析
+    """
+    __tablename__ = 'positions'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, unique=True, index=True)
+    cost_price = Column(Float, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def __repr__(self):
+        return f"<Position(code={self.code}, cost={self.cost_price}, qty={self.quantity})>"
+
+
+class PositionSnapshot(Base):
+    """
+    每日持仓快照
+    
+    记录每日持仓状态，用于持仓历史回溯
+    """
+    __tablename__ = 'position_snapshots'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(Date, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    cost_price = Column(Float)
+    quantity = Column(Integer)
+    close_price = Column(Float)
+    market_value = Column(Float)
+    profit_loss = Column(Float)
+    profit_pct = Column(Float)
+    
+    __table_args__ = (
+        UniqueConstraint('code', 'date', name='uix_snapshot_code_date'),
+        Index('ix_snapshot_code_date', 'code', 'date'),
+    )
+    
+    def __repr__(self):
+        return f"<PositionSnapshot(code={self.code}, date={self.date}, qty={self.quantity})>"
+
+
+class TradeLog(Base):
+    """
+    交易记录（买入/卖出）
+    """
+    __tablename__ = 'trade_logs'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    action = Column(String(10), nullable=False)  # BUY/SELL
+    price = Column(Float, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    amount = Column(Float)
+    note = Column(String(200))
+    created_at = Column(DateTime, default=datetime.now)
+    
+    def __repr__(self):
+        return f"<TradeLog({self.action} {self.code} qty={self.quantity} price={self.price})>"
+
+
+class Capital(Base):
+    """
+    用户资金管理模型
+    
+    记录总资金与风险配置，用于仓位与风险敞口计算
+    """
+    __tablename__ = 'capital'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    total_capital = Column(Float, nullable=False)
+    risk_per_trade = Column(Float, default=0.02)
+    max_position_ratio = Column(Float, default=0.30)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    def __repr__(self):
+        return f"<Capital(total={self.total_capital}, risk={self.risk_per_trade})>"
 
 
 class DatabaseManager:
@@ -168,6 +285,8 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        # 确保历史表与新增列可用（轻量迁移）
+        self._ensure_stock_daily_schema()
         
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -185,6 +304,41 @@ class DatabaseManager:
         if cls._instance is not None:
             cls._instance._engine.dispose()
             cls._instance = None
+
+    def _ensure_stock_daily_schema(self) -> None:
+        """
+        确保 stock_daily 表包含新增指标列（SQLite 轻量迁移）
+        """
+        required_columns = {
+            'ma60': 'REAL',
+            'ma120': 'REAL',
+            'ma250': 'REAL',
+            'rsi': 'REAL',
+            'macd_dif': 'REAL',
+            'macd_dea': 'REAL',
+            'macd_hist': 'REAL',
+            'kdj_k': 'REAL',
+            'kdj_d': 'REAL',
+            'kdj_j': 'REAL',
+            'boll_upper': 'REAL',
+            'boll_mid': 'REAL',
+            'boll_lower': 'REAL',
+            'atr': 'REAL',
+            'obv': 'REAL',
+            'cci': 'REAL',
+        }
+        with self._engine.connect() as conn:
+            try:
+                result = conn.execute(text("PRAGMA table_info(stock_daily)"))
+                existing_cols = {row[1] for row in result.fetchall()}
+                missing = [c for c in required_columns if c not in existing_cols]
+                for col in missing:
+                    col_type = required_columns[col]
+                    conn.execute(text(f"ALTER TABLE stock_daily ADD COLUMN {col} {col_type}"))
+                if missing:
+                    logger.info(f"stock_daily 新增列: {', '.join(missing)}")
+            except Exception as e:
+                logger.warning(f"检查/更新 stock_daily 表结构失败: {e}")
     
     def get_session(self) -> Session:
         """
@@ -350,7 +504,23 @@ class DatabaseManager:
                         existing.ma5 = row.get('ma5')
                         existing.ma10 = row.get('ma10')
                         existing.ma20 = row.get('ma20')
+                        existing.ma60 = row.get('ma60')
+                        existing.ma120 = row.get('ma120')
+                        existing.ma250 = row.get('ma250')
                         existing.volume_ratio = row.get('volume_ratio')
+                        existing.rsi = row.get('rsi')
+                        existing.macd_dif = row.get('macd_dif')
+                        existing.macd_dea = row.get('macd_dea')
+                        existing.macd_hist = row.get('macd_hist')
+                        existing.kdj_k = row.get('kdj_k')
+                        existing.kdj_d = row.get('kdj_d')
+                        existing.kdj_j = row.get('kdj_j')
+                        existing.boll_upper = row.get('boll_upper')
+                        existing.boll_mid = row.get('boll_mid')
+                        existing.boll_lower = row.get('boll_lower')
+                        existing.atr = row.get('atr')
+                        existing.obv = row.get('obv')
+                        existing.cci = row.get('cci')
                         existing.data_source = data_source
                         existing.updated_at = datetime.now()
                     else:
@@ -368,7 +538,23 @@ class DatabaseManager:
                             ma5=row.get('ma5'),
                             ma10=row.get('ma10'),
                             ma20=row.get('ma20'),
+                            ma60=row.get('ma60'),
+                            ma120=row.get('ma120'),
+                            ma250=row.get('ma250'),
                             volume_ratio=row.get('volume_ratio'),
+                            rsi=row.get('rsi'),
+                            macd_dif=row.get('macd_dif'),
+                            macd_dea=row.get('macd_dea'),
+                            macd_hist=row.get('macd_hist'),
+                            kdj_k=row.get('kdj_k'),
+                            kdj_d=row.get('kdj_d'),
+                            kdj_j=row.get('kdj_j'),
+                            boll_upper=row.get('boll_upper'),
+                            boll_mid=row.get('boll_mid'),
+                            boll_lower=row.get('boll_lower'),
+                            atr=row.get('atr'),
+                            obv=row.get('obv'),
+                            cci=row.get('cci'),
                             data_source=data_source,
                         )
                         session.add(record)
@@ -437,7 +623,313 @@ class DatabaseManager:
             # 均线形态判断
             context['ma_status'] = self._analyze_ma_status(today_data)
         
+        # 关联持仓信息（如有）
+        position = self.get_position(code)
+        capital = self.get_capital()
+        if position:
+            current_price = today_data.close or 0
+            cost_price = position.cost_price or 0
+            quantity = position.quantity or 0
+            profit_loss = (current_price - cost_price) * quantity
+            profit_pct = ((current_price - cost_price) / cost_price * 100) if cost_price > 0 else 0
+            position_ratio = None
+            risk_exposure = None
+            risk_ratio = None
+            if capital and capital.total_capital > 0:
+                market_value = current_price * quantity
+                position_ratio = market_value / capital.total_capital
+                # 默认止损位为成本价 -5%
+                stop_loss_price = cost_price * 0.95
+                risk_exposure = max(cost_price - stop_loss_price, 0) * quantity
+                risk_ratio = risk_exposure / capital.total_capital
+            context['position'] = {
+                'cost_price': cost_price,
+                'quantity': quantity,
+                'market_value': current_price * quantity,
+                'profit_loss': round(profit_loss, 2),
+                'profit_pct': round(profit_pct, 2),
+                'position_ratio': round(position_ratio, 4) if position_ratio is not None else None,
+                'risk_exposure': round(risk_exposure, 2) if risk_exposure is not None else None,
+                'risk_ratio': round(risk_ratio, 4) if risk_ratio is not None else None,
+            }
+            context['is_holding'] = True
+        else:
+            context['is_holding'] = False
+        
+        if capital:
+            context['capital'] = {
+                'total_capital': capital.total_capital,
+                'risk_per_trade': capital.risk_per_trade,
+                'max_position_ratio': capital.max_position_ratio,
+            }
+        
+        history_summary = self.get_position_history_summary(code)
+        if history_summary:
+            context['position_history'] = history_summary
+        
         return context
+
+    def get_position(self, code: str) -> Optional[Position]:
+        """获取指定股票的持仓信息"""
+        with self.get_session() as session:
+            return session.execute(
+                select(Position).where(Position.code == code)
+            ).scalar_one_or_none()
+
+    def list_positions(self) -> List[Position]:
+        """获取全部持仓列表"""
+        with self.get_session() as session:
+            return list(
+                session.execute(select(Position).order_by(Position.code)).scalars().all()
+            )
+
+    def upsert_position(self, code: str, cost_price: float, quantity: int) -> Position:
+        """
+        新增或更新持仓信息
+        
+        Args:
+            code: 股票代码
+            cost_price: 成本价
+            quantity: 持仓数量
+        """
+        with self.get_session() as session:
+            position = session.execute(
+                select(Position).where(Position.code == code)
+            ).scalar_one_or_none()
+            
+            if position:
+                position.cost_price = cost_price
+                position.quantity = quantity
+                position.updated_at = datetime.now()
+            else:
+                position = Position(
+                    code=code,
+                    cost_price=cost_price,
+                    quantity=quantity
+                )
+                session.add(position)
+            
+            session.commit()
+            return position
+
+    def remove_position(self, code: str) -> bool:
+        """删除指定股票的持仓信息"""
+        with self.get_session() as session:
+            position = session.execute(
+                select(Position).where(Position.code == code)
+            ).scalar_one_or_none()
+            
+            if not position:
+                return False
+            
+            session.delete(position)
+            session.commit()
+            return True
+
+    def save_daily_snapshot(self, target_date: Optional[date] = None) -> int:
+        """
+        保存每日持仓快照（按当日收盘价计算）
+        """
+        if target_date is None:
+            target_date = date.today()
+        
+        positions = self.list_positions()
+        if not positions:
+            return 0
+        
+        saved = 0
+        with self.get_session() as session:
+            try:
+                for pos in positions:
+                    latest = self.get_latest_data(pos.code, days=1)
+                    close_price = latest[0].close if latest and latest[0].close else pos.cost_price
+                    market_value = (pos.quantity or 0) * (close_price or 0)
+                    profit_loss = (close_price - pos.cost_price) * pos.quantity if pos.cost_price else 0
+                    profit_pct = ((close_price - pos.cost_price) / pos.cost_price * 100) if pos.cost_price else 0
+                    
+                    existing = session.execute(
+                        select(PositionSnapshot).where(
+                            and_(
+                                PositionSnapshot.code == pos.code,
+                                PositionSnapshot.date == target_date
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    
+                    if existing:
+                        existing.cost_price = pos.cost_price
+                        existing.quantity = pos.quantity
+                        existing.close_price = close_price
+                        existing.market_value = market_value
+                        existing.profit_loss = profit_loss
+                        existing.profit_pct = profit_pct
+                    else:
+                        snapshot = PositionSnapshot(
+                            date=target_date,
+                            code=pos.code,
+                            cost_price=pos.cost_price,
+                            quantity=pos.quantity,
+                            close_price=close_price,
+                            market_value=market_value,
+                            profit_loss=profit_loss,
+                            profit_pct=profit_pct,
+                        )
+                        session.add(snapshot)
+                        saved += 1
+                
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        
+        return saved
+
+    def list_position_history(self, code: str) -> List[PositionSnapshot]:
+        """获取指定股票的持仓历史快照"""
+        with self.get_session() as session:
+            return list(
+                session.execute(
+                    select(PositionSnapshot)
+                    .where(PositionSnapshot.code == code)
+                    .order_by(PositionSnapshot.date)
+                ).scalars().all()
+            )
+
+    def add_trade_log(
+        self,
+        trade_date: date,
+        code: str,
+        action: str,
+        price: float,
+        quantity: int,
+        note: Optional[str] = None
+    ) -> TradeLog:
+        """新增交易记录"""
+        amount = price * quantity
+        with self.get_session() as session:
+            log = TradeLog(
+                trade_date=trade_date,
+                code=code,
+                action=action,
+                price=price,
+                quantity=quantity,
+                amount=amount,
+                note=note
+            )
+            session.add(log)
+            session.commit()
+            return log
+
+    def list_trade_logs(self, code: Optional[str] = None) -> List[TradeLog]:
+        """查询交易记录"""
+        with self.get_session() as session:
+            query = select(TradeLog)
+            if code:
+                query = query.where(TradeLog.code == code)
+            query = query.order_by(TradeLog.trade_date.desc(), TradeLog.id.desc())
+            return list(session.execute(query).scalars().all())
+
+    def get_position_history_summary(self, code: str) -> Optional[Dict[str, Any]]:
+        """
+        计算持仓历史摘要（建仓日期、持仓天数、最大浮盈、最大回撤）
+        """
+        snapshots = self.list_position_history(code)
+        if not snapshots:
+            return None
+        
+        profit_pcts = [s.profit_pct for s in snapshots if s.profit_pct is not None]
+        if not profit_pcts:
+            return None
+        
+        max_profit = max(profit_pcts)
+        # 最大回撤计算（基于盈亏比例序列）
+        peak = profit_pcts[0]
+        max_drawdown = 0.0
+        for pct in profit_pcts:
+            peak = max(peak, pct)
+            drawdown = peak - pct
+            max_drawdown = max(max_drawdown, drawdown)
+        
+        first_date = snapshots[0].date
+        holding_days = (date.today() - first_date).days + 1
+        
+        return {
+            'first_buy_date': first_date.isoformat(),
+            'holding_days': holding_days,
+            'max_profit_pct': round(max_profit, 2),
+            'max_drawdown': round(max_drawdown, 2),
+        }
+
+    def get_capital(self) -> Optional[Capital]:
+        """获取资金配置"""
+        with self.get_session() as session:
+            return session.execute(select(Capital)).scalar_one_or_none()
+
+    def set_capital(
+        self, 
+        total_capital: float, 
+        risk_per_trade: float = 0.02, 
+        max_position_ratio: float = 0.30
+    ) -> Capital:
+        """设置或更新资金配置"""
+        with self.get_session() as session:
+            capital = session.execute(select(Capital)).scalar_one_or_none()
+            if capital:
+                capital.total_capital = total_capital
+                capital.risk_per_trade = risk_per_trade
+                capital.max_position_ratio = max_position_ratio
+                capital.updated_at = datetime.now()
+            else:
+                capital = Capital(
+                    total_capital=total_capital,
+                    risk_per_trade=risk_per_trade,
+                    max_position_ratio=max_position_ratio,
+                )
+                session.add(capital)
+            session.commit()
+            return capital
+
+    def get_portfolio_summary(self) -> Dict[str, Any]:
+        """获取持仓组合摘要（基于最新收盘价）"""
+        capital = self.get_capital()
+        if not capital:
+            return {'error': '未设置总资金'}
+        
+        positions = self.list_positions()
+        total = capital.total_capital
+        invested = 0.0
+        holdings = []
+        
+        for pos in positions:
+            latest = self.get_latest_data(pos.code, days=1)
+            current_price = latest[0].close if latest and latest[0].close else pos.cost_price
+            market_value = pos.quantity * current_price
+            invested += market_value
+            
+            stop_loss_price = pos.cost_price * 0.95
+            risk_exposure = max(pos.cost_price - stop_loss_price, 0) * pos.quantity
+            
+            holdings.append({
+                'code': pos.code,
+                'cost_price': pos.cost_price,
+                'quantity': pos.quantity,
+                'current_price': current_price,
+                'market_value': market_value,
+                'position_ratio': market_value / total if total > 0 else 0,
+                'profit_pct': (current_price - pos.cost_price) / pos.cost_price * 100 if pos.cost_price > 0 else 0,
+                'risk_exposure': risk_exposure,
+            })
+        
+        return {
+            'total_capital': total,
+            'invested': invested,
+            'available': total - invested,
+            'invested_ratio': invested / total if total > 0 else 0,
+            'holdings': holdings,
+            'total_risk_exposure': sum(h['risk_exposure'] for h in holdings),
+            'risk_per_trade': capital.risk_per_trade,
+            'max_position_ratio': capital.max_position_ratio,
+        }
     
     def _analyze_ma_status(self, data: StockDaily) -> str:
         """

@@ -29,6 +29,7 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
+from config import get_config
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ class BaseFetcher(ABC):
             标准化的 DataFrame，包含技术指标
         """
         # 计算日期范围
+        start_date_provided = start_date is not None
         if end_date is None:
             end_date = datetime.now().strftime('%Y-%m-%d')
         
@@ -133,17 +135,56 @@ class BaseFetcher(ABC):
         logger.info(f"[{self.name}] 获取 {stock_code} 数据: {start_date} ~ {end_date}")
         
         try:
-            # Step 1: 获取原始数据
-            raw_df = self._fetch_raw_data(stock_code, start_date, end_date)
+            config = get_config()
+            batch_days = config.history_batch_days
             
-            if raw_df is None or raw_df.empty:
+            # Step 1: 获取原始数据（支持分批拉取）
+            raw_dfs: List[pd.DataFrame] = []
+            if not start_date_provided and days > batch_days:
+                from datetime import timedelta
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                remaining_days = days
+                
+                while remaining_days > 0:
+                    current_batch_days = min(batch_days, remaining_days)
+                    batch_span = current_batch_days * 2  # 按日历日估算
+                    batch_start_dt = end_dt - timedelta(days=batch_span)
+                    batch_start = batch_start_dt.strftime('%Y-%m-%d')
+                    batch_end = end_dt.strftime('%Y-%m-%d')
+                    
+                    logger.info(f"[{self.name}] 分批拉取 {stock_code}: {batch_start} ~ {batch_end}")
+                    batch_raw = self._fetch_raw_data(stock_code, batch_start, batch_end)
+                    if batch_raw is not None and not batch_raw.empty:
+                        raw_dfs.append(batch_raw)
+                    else:
+                        logger.warning(f"[{self.name}] 分批数据为空: {batch_start} ~ {batch_end}")
+                    
+                    remaining_days -= current_batch_days
+                    end_dt = batch_start_dt
+                    
+                    # 分批间隔（防封禁）
+                    self.random_sleep(
+                        config.history_batch_sleep_min,
+                        config.history_batch_sleep_max
+                    )
+            else:
+                raw_df = self._fetch_raw_data(stock_code, start_date, end_date)
+                if raw_df is not None and not raw_df.empty:
+                    raw_dfs.append(raw_df)
+            
+            if not raw_dfs:
                 raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
             
-            # Step 2: 标准化列名
-            df = self._normalize_data(raw_df, stock_code)
+            # Step 2: 标准化列名并合并
+            normalized = []
+            for raw in raw_dfs:
+                normalized.append(self._normalize_data(raw, stock_code))
+            df = pd.concat(normalized, ignore_index=True)
             
             # Step 3: 数据清洗
             df = self._clean_data(df)
+            # 去重
+            df = df.drop_duplicates(subset=['date']).reset_index(drop=True)
             
             # Step 4: 计算技术指标
             df = self._calculate_indicators(df)
@@ -187,26 +228,91 @@ class BaseFetcher(ABC):
     
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算技术指标
+        计算技术指标（扩展版）
         
         计算指标：
-        - MA5, MA10, MA20: 移动平均线
-        - Volume_Ratio: 量比（今日成交量 / 5日平均成交量）
+        - MA5, MA10, MA20, MA60, MA120, MA250
+        - RSI, MACD, KDJ, Bollinger Bands, ATR
+        - OBV, CCI, Volume_Ratio
         """
         df = df.copy()
         
-        # 移动平均线
-        df['ma5'] = df['close'].rolling(window=5, min_periods=1).mean()
-        df['ma10'] = df['close'].rolling(window=10, min_periods=1).mean()
-        df['ma20'] = df['close'].rolling(window=20, min_periods=1).mean()
+        # === 移动平均线（扩展至长期均线）===
+        for period in [5, 10, 20, 60, 120, 250]:
+            df[f'ma{period}'] = df['close'].rolling(window=period, min_periods=1).mean()
         
-        # 量比：当日成交量 / 5日平均成交量
+        # === 量比：当日成交量 / 5日平均成交量 ===
         avg_volume_5 = df['volume'].rolling(window=5, min_periods=1).mean()
         df['volume_ratio'] = df['volume'] / avg_volume_5.shift(1)
         df['volume_ratio'] = df['volume_ratio'].fillna(1.0)
         
+        # === RSI（相对强弱指数）===
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = (-delta).where(delta < 0, 0)
+        avg_gain = gain.rolling(window=14, min_periods=1).mean()
+        avg_loss = loss.rolling(window=14, min_periods=1).mean()
+        rs = avg_gain / avg_loss.replace(0, np.inf)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = df['rsi'].fillna(50)
+        
+        # === MACD（12/26/9）===
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd_dif'] = ema12 - ema26
+        df['macd_dea'] = df['macd_dif'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = 2 * (df['macd_dif'] - df['macd_dea'])
+        
+        # === KDJ（9日）===
+        low_min = df['low'].rolling(window=9, min_periods=1).min()
+        high_max = df['high'].rolling(window=9, min_periods=1).max()
+        rsv = (df['close'] - low_min) / (high_max - low_min + 1e-10) * 100
+        df['kdj_k'] = rsv.ewm(com=2, adjust=False).mean()
+        df['kdj_d'] = df['kdj_k'].ewm(com=2, adjust=False).mean()
+        df['kdj_j'] = 3 * df['kdj_k'] - 2 * df['kdj_d']
+        
+        # === 布林带（20日，2倍标准差）===
+        df['boll_mid'] = df['close'].rolling(window=20, min_periods=1).mean()
+        boll_std = df['close'].rolling(window=20, min_periods=1).std()
+        df['boll_upper'] = df['boll_mid'] + 2 * boll_std
+        df['boll_lower'] = df['boll_mid'] - 2 * boll_std
+        
+        # === ATR（真实波动幅度，14日）===
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(window=14, min_periods=1).mean()
+        
+        # === OBV（能量潮）===
+        obv = [0]
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i - 1]:
+                obv.append(obv[-1] + df['volume'].iloc[i])
+            elif df['close'].iloc[i] < df['close'].iloc[i - 1]:
+                obv.append(obv[-1] - df['volume'].iloc[i])
+            else:
+                obv.append(obv[-1])
+        df['obv'] = obv
+        
+        # === CCI（顺势指标，20日）===
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        sma_tp = tp.rolling(window=20, min_periods=1).mean()
+        mad = tp.rolling(window=20, min_periods=1).apply(
+            lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+        )
+        df['cci'] = (tp - sma_tp) / (0.015 * mad + 1e-10)
+        df['cci'] = df['cci'].fillna(0)
+        
         # 保留2位小数
-        for col in ['ma5', 'ma10', 'ma20', 'volume_ratio']:
+        float_cols = [
+            'ma5', 'ma10', 'ma20', 'ma60', 'ma120', 'ma250',
+            'volume_ratio', 'rsi', 'macd_dif', 'macd_dea', 'macd_hist',
+            'kdj_k', 'kdj_d', 'kdj_j',
+            'boll_mid', 'boll_upper', 'boll_lower',
+            'atr', 'cci'
+        ]
+        for col in float_cols:
             if col in df.columns:
                 df[col] = df[col].round(2)
         

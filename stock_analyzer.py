@@ -73,6 +73,7 @@ class TrendAnalysisResult:
     ma20: float = 0.0
     ma60: float = 0.0
     current_price: float = 0.0
+    atr: float = 0.0
     
     # 乖离率（与 MA5 的偏离度）
     bias_ma5: float = 0.0            # (Close - MA5) / MA5 * 100
@@ -107,6 +108,7 @@ class TrendAnalysisResult:
             'ma20': self.ma20,
             'ma60': self.ma60,
             'current_price': self.current_price,
+            'atr': self.atr,
             'bias_ma5': self.bias_ma5,
             'bias_ma10': self.bias_ma10,
             'bias_ma20': self.bias_ma20,
@@ -166,6 +168,7 @@ class StockTrendAnalyzer:
         
         # 计算均线
         df = self._calculate_mas(df)
+        df = self._calculate_atr(df)
         
         # 获取最新数据
         latest = df.iloc[-1]
@@ -174,6 +177,7 @@ class StockTrendAnalyzer:
         result.ma10 = float(latest['MA10'])
         result.ma20 = float(latest['MA20'])
         result.ma60 = float(latest.get('MA60', 0))
+        result.atr = float(latest.get('ATR', 0))
         
         # 1. 趋势判断
         self._analyze_trend(df, result)
@@ -203,6 +207,79 @@ class StockTrendAnalyzer:
         else:
             df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
         return df
+    
+    def _calculate_atr(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算 ATR（14日真实波动幅度均值）"""
+        df = df.copy()
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['ATR'] = tr.rolling(window=14, min_periods=1).mean()
+        return df
+
+    def calculate_stop_loss(
+        self,
+        result: TrendAnalysisResult,
+        cost_price: Optional[float] = None
+    ) -> Dict[str, float]:
+        """
+        计算动态止损位
+        
+        Args:
+            result: 趋势分析结果
+            cost_price: 用户持仓成本价（可选）
+        
+        Returns:
+            止损位字典
+        """
+        current = result.current_price
+        atr = result.atr if result.atr > 0 else current * 0.02
+        base_price = cost_price if cost_price else current
+        
+        stops = {
+            'cost_atr_stop': base_price - 2 * atr,
+            'cost_fixed_stop': base_price * 0.95,
+            'breakeven_stop': base_price,
+            'ma10_stop': result.ma10 * 0.97 if result.ma10 > 0 else current * 0.95,
+            'ma20_stop': result.ma20 * 0.95 if result.ma20 > 0 else current * 0.92,
+        }
+        
+        # 移动止损：浮盈后上移
+        if cost_price and current > cost_price:
+            profit_pct = (current - cost_price) / cost_price
+            if profit_pct > 0.10:
+                stops['trailing_stop'] = current * 0.95
+            elif profit_pct > 0.05:
+                stops['trailing_stop'] = cost_price * 1.02
+        
+        return stops
+
+    def calculate_position_size(
+        self,
+        total_capital: float,
+        entry_price: float,
+        stop_loss: float,
+        risk_per_trade: float = 0.02
+    ) -> Dict[str, Any]:
+        """
+        基于风险计算建议仓位
+        """
+        risk_per_share = entry_price - stop_loss
+        if risk_per_share <= 0:
+            return {'error': '止损价必须低于入场价'}
+        
+        max_risk_amount = total_capital * risk_per_trade
+        suggested_shares = int(max_risk_amount / risk_per_share)
+        suggested_amount = suggested_shares * entry_price
+        
+        return {
+            'suggested_shares': suggested_shares,
+            'suggested_amount': suggested_amount,
+            'position_ratio': suggested_amount / total_capital if total_capital > 0 else 0,
+            'max_loss': suggested_shares * risk_per_share,
+            'max_loss_ratio': risk_per_trade,
+        }
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """

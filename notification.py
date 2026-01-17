@@ -131,6 +131,35 @@ class NotificationService:
                 f"**操作建议：{result.operation_advice}** | **综合评分：{result.sentiment_score}分** | **趋势预测：{result.trend_prediction}** | **置信度：{confidence_stars}**",
                 "",
             ])
+
+            # 持仓信息（如有）
+            if getattr(result, 'has_position', False) and getattr(result, 'position_info', None):
+                pos = result.position_info
+                report_lines.extend([
+                    "**💼 持仓信息**",
+                    f"- 成本价：{pos.get('cost_price', 'N/A')} 元",
+                    f"- 持仓量：{pos.get('quantity', 'N/A')} 股",
+                    f"- 浮动盈亏：{pos.get('profit_loss', 'N/A')} 元 ({pos.get('profit_pct', 'N/A')}%)",
+                    "",
+                ])
+            
+            # 风险管理建议（止损/仓位）
+            if getattr(result, 'risk_management', None):
+                rm = result.risk_management or {}
+                stop_loss = rm.get('stop_loss', {})
+                position_sizing = rm.get('position_sizing', {})
+                report_lines.extend([
+                    "**🛡️ 风险管理**",
+                    f"- ATR止损：{stop_loss.get('cost_atr_stop', stop_loss.get('current_atr_stop', 'N/A'))}",
+                    f"- MA10止损：{stop_loss.get('ma10_stop', 'N/A')}",
+                    f"- 移动止损：{stop_loss.get('trailing_stop', 'N/A')}",
+                ])
+                if position_sizing:
+                    report_lines.append(
+                        f"- 建议仓位：{position_sizing.get('suggested_shares', 'N/A')}股 "
+                        f"(占比{position_sizing.get('position_ratio', 'N/A')})"
+                    )
+                report_lines.append("")
             
             # 核心看点
             if hasattr(result, 'key_points') and result.key_points:
@@ -386,6 +415,36 @@ class NotificationService:
                 f"⏰ **时效性**: {time_sense}",
                 "",
             ])
+
+            # 持仓信息（如有）
+            if getattr(result, 'has_position', False) and getattr(result, 'position_info', None):
+                pos = result.position_info
+                report_lines.extend([
+                    "**💼 持仓概览**",
+                    "",
+                    f"- 成本价：{pos.get('cost_price', 'N/A')} 元",
+                    f"- 持仓量：{pos.get('quantity', 'N/A')} 股",
+                    f"- 浮动盈亏：{pos.get('profit_loss', 'N/A')} 元 ({pos.get('profit_pct', 'N/A')}%)",
+                    "",
+                ])
+            
+            if getattr(result, 'risk_management', None):
+                rm = result.risk_management or {}
+                stop_loss = rm.get('stop_loss', {})
+                position_sizing = rm.get('position_sizing', {})
+                report_lines.extend([
+                    "**🛡️ 风险管理**",
+                    "",
+                    f"- ATR止损：{stop_loss.get('cost_atr_stop', stop_loss.get('current_atr_stop', 'N/A'))}",
+                    f"- MA10止损：{stop_loss.get('ma10_stop', 'N/A')}",
+                    f"- 移动止损：{stop_loss.get('trailing_stop', 'N/A')}",
+                ])
+                if position_sizing:
+                    report_lines.append(
+                        f"- 建议仓位：{position_sizing.get('suggested_shares', 'N/A')}股 "
+                        f"(占比{position_sizing.get('position_ratio', 'N/A')})"
+                    )
+                report_lines.append("")
             
             # 持仓分类建议
             if pos_advice:
@@ -660,6 +719,25 @@ class NotificationService:
             if has_pos:
                 lines.append(f"💼持仓: {has_pos}")
             lines.append("")
+
+        # 持仓盈亏信息
+        if getattr(result, 'has_position', False) and getattr(result, 'position_info', None):
+            pos = result.position_info
+            lines.append(
+                f"💼持仓: 成本{pos.get('cost_price', 'N/A')} | "
+                f"数量{pos.get('quantity', 'N/A')} | "
+                f"盈亏{pos.get('profit_loss', 'N/A')}元({pos.get('profit_pct', 'N/A')}%)"
+            )
+            lines.append("")
+        
+        # 止损位提醒
+        if getattr(result, 'risk_management', None):
+            stop_loss = (result.risk_management or {}).get('stop_loss', {})
+            if stop_loss:
+                lines.append(
+                    f"🛑止损: {stop_loss.get('cost_atr_stop', stop_loss.get('current_atr_stop', 'N/A'))}"
+                )
+                lines.append("")
         
         # 检查清单
         checklist = battle.get('action_checklist', []) if battle else []

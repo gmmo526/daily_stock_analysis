@@ -37,6 +37,7 @@ if os.getenv("GITHUB_ACTIONS") != "true":
     # 如果都没有配置，则不设置代理，直接连接（适用于国内网络环境）
 
 import argparse
+import csv
 import logging
 import sys
 import time
@@ -202,7 +203,7 @@ class StockAnalysisPipeline:
             
             # 从数据源获取数据
             logger.info(f"[{code}] 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            df, source_name = self.fetcher_manager.get_daily_data(code, days=self.config.history_days)
             
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -267,6 +268,15 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.warning(f"[{code}] 获取筹码分布失败: {e}")
             
+            # Step 2.1: 获取资金流向
+            fund_flow: Optional[Dict[str, Any]] = None
+            try:
+                fund_flow = self.akshare_fetcher.get_fund_flow(code)
+                if fund_flow:
+                    logger.info(f"[{code}] 资金流向: 主力净流入={fund_flow.get('main_net_inflow', 0):.2f}")
+            except Exception as e:
+                logger.warning(f"[{code}] 获取资金流向失败: {e}")
+            
             # Step 3: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None
             try:
@@ -319,6 +329,7 @@ class StockAnalysisPipeline:
                 realtime_quote, 
                 chip_data, 
                 trend_result,
+                fund_flow,
                 stock_name  # 传入股票名称
             )
             
@@ -338,18 +349,20 @@ class StockAnalysisPipeline:
         realtime_quote: Optional[RealtimeQuote],
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
+        fund_flow: Optional[Dict[str, Any]],
         stock_name: str = ""
     ) -> Dict[str, Any]:
         """
         增强分析上下文
         
-        将实时行情、筹码分布、趋势分析结果、股票名称添加到上下文中
+        将实时行情、筹码分布、资金流向、趋势分析结果、股票名称添加到上下文中
         
         Args:
             context: 原始上下文
             realtime_quote: 实时行情数据
             chip_data: 筹码分布数据
             trend_result: 趋势分析结果
+            fund_flow: 资金流向数据
             stock_name: 股票名称
             
         Returns:
@@ -403,7 +416,39 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'atr': trend_result.atr,
             }
+            
+            # 风险管理建议（基于成本价与总资金）
+            position = context.get('position')
+            capital = context.get('capital')
+            cost_price = position.get('cost_price') if position else None
+            stop_loss = self.trend_analyzer.calculate_stop_loss(trend_result, cost_price)
+            
+            risk_management = {
+                'stop_loss': stop_loss,
+            }
+            
+            if capital and capital.get('total_capital'):
+                entry_price = (
+                    realtime_quote.price if realtime_quote and realtime_quote.price
+                    else trend_result.current_price
+                )
+                stop_price = stop_loss.get('cost_atr_stop') if cost_price else stop_loss.get('ma20_stop')
+                if stop_price and entry_price:
+                    risk_management['position_sizing'] = self.trend_analyzer.calculate_position_size(
+                        total_capital=capital['total_capital'],
+                        entry_price=entry_price,
+                        stop_loss=stop_price,
+                        risk_per_trade=capital.get('risk_per_trade', 0.02)
+                    )
+                    risk_management['capital'] = capital
+            
+            enhanced['risk_management'] = risk_management
+
+        # 添加资金流向
+        if fund_flow:
+            enhanced['fund_flow'] = fund_flow
         
         return enhanced
     
@@ -511,6 +556,13 @@ class StockAnalysisPipeline:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
             return []
         
+        # 自动记录持仓快照（不影响主流程）
+        try:
+            snapshot_count = self.db.save_daily_snapshot()
+            logger.info(f"持仓快照记录完成，新增 {snapshot_count} 条")
+        except Exception as e:
+            logger.warning(f"持仓快照记录失败: {e}")
+        
         logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")
         logger.info(f"股票列表: {', '.join(stock_codes)}")
         logger.info(f"并发数: {self.max_workers}, 模式: {'仅获取数据' if dry_run else '完整分析'}")
@@ -592,6 +644,113 @@ class StockAnalysisPipeline:
             logger.error(f"发送通知失败: {e}")
 
 
+def _load_positions_csv(filepath: str) -> Dict[str, Dict[str, Any]]:
+    """读取持仓 CSV 文件"""
+    positions: Dict[str, Dict[str, Any]] = {}
+    with open(filepath, newline='', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            code = (row.get('code') or '').strip()
+            if not code:
+                continue
+            try:
+                cost_price = float(row.get('cost_price', 0) or 0)
+                quantity = int(float(row.get('quantity', 0) or 0))
+            except ValueError:
+                continue
+            positions[code] = {
+                'cost_price': cost_price,
+                'quantity': quantity,
+                'note': (row.get('note') or '').strip()
+            }
+    return positions
+
+
+def _export_positions_csv(filepath: str, positions: List[Any]) -> None:
+    """导出持仓到 CSV 文件"""
+    with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['code', 'cost_price', 'quantity', 'note'])
+        for pos in positions:
+            writer.writerow([pos.code, pos.cost_price, pos.quantity, ''])
+
+
+def _get_latest_close(db: DatabaseManager, code: str) -> Optional[float]:
+    """获取最新收盘价"""
+    latest = db.get_latest_data(code, days=1)
+    if latest and latest[0].close:
+        return latest[0].close
+    return None
+
+
+def _import_positions_from_csv(
+    db: DatabaseManager,
+    filepath: str,
+    trade_date: Optional[date] = None
+) -> Dict[str, int]:
+    """
+    从 CSV 导入持仓并记录交易变动
+    """
+    if trade_date is None:
+        trade_date = date.today()
+    
+    csv_positions = _load_positions_csv(filepath)
+    db_positions = {p.code: p for p in db.list_positions()}
+    
+    counters = {'buy': 0, 'sell': 0, 'update': 0, 'remove': 0, 'no_change': 0}
+    
+    # 处理 CSV 中的持仓
+    for code, new_pos in csv_positions.items():
+        new_qty = new_pos['quantity']
+        new_cost = new_pos['cost_price']
+        note = new_pos.get('note') or None
+        
+        if new_qty <= 0:
+            # 视为清仓
+            if code in db_positions:
+                old = db_positions[code]
+                sell_price = _get_latest_close(db, code) or old.cost_price
+                db.add_trade_log(trade_date, code, 'SELL', sell_price, old.quantity, note or 'CSV清仓')
+                db.remove_position(code)
+                counters['remove'] += 1
+            continue
+        
+        if code not in db_positions:
+            # 新增持仓
+            db.upsert_position(code, new_cost, new_qty)
+            db.add_trade_log(trade_date, code, 'BUY', new_cost, new_qty, note or 'CSV新增')
+            counters['buy'] += 1
+            continue
+        
+        old = db_positions[code]
+        if new_qty > old.quantity:
+            diff = new_qty - old.quantity
+            db.upsert_position(code, new_cost, new_qty)
+            db.add_trade_log(trade_date, code, 'BUY', new_cost, diff, note or 'CSV加仓')
+            counters['buy'] += 1
+        elif new_qty < old.quantity:
+            diff = old.quantity - new_qty
+            sell_price = _get_latest_close(db, code) or new_cost or old.cost_price
+            db.upsert_position(code, new_cost, new_qty)
+            db.add_trade_log(trade_date, code, 'SELL', sell_price, diff, note or 'CSV减仓')
+            counters['sell'] += 1
+        elif new_cost != old.cost_price:
+            db.upsert_position(code, new_cost, new_qty)
+            counters['update'] += 1
+        else:
+            counters['no_change'] += 1
+    
+    # CSV 不存在的持仓视为清仓
+    for code, old in db_positions.items():
+        if code not in csv_positions:
+            sell_price = _get_latest_close(db, code) or old.cost_price
+            db.add_trade_log(trade_date, code, 'SELL', sell_price, old.quantity, 'CSV清仓')
+            db.remove_position(code)
+            counters['remove'] += 1
+    
+    return counters
+
+
 def parse_arguments() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -606,6 +765,9 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --no-notify        # 不发送推送通知
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --position add 600519 --cost 1800.50 --qty 100
+  python main.py --position list
+  python main.py --position remove 600519
         '''
     )
     
@@ -625,6 +787,12 @@ def parse_arguments() -> argparse.Namespace:
         '--stocks',
         type=str,
         help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
+    )
+
+    parser.add_argument(
+        '--use-positions',
+        action='store_true',
+        help='优先使用持仓列表作为分析股票'
     )
     
     parser.add_argument(
@@ -656,6 +824,53 @@ def parse_arguments() -> argparse.Namespace:
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
+    )
+
+    parser.add_argument(
+        '--capital',
+        choices=['set', 'status'],
+        help='资金管理：set/status'
+    )
+    parser.add_argument(
+        '--capital-amount',
+        type=float,
+        default=None,
+        help='总资金金额（配合 --capital set 使用）'
+    )
+    parser.add_argument(
+        '--risk',
+        type=float,
+        default=None,
+        help='单笔风险比例（默认 0.02）'
+    )
+    parser.add_argument(
+        '--max-position',
+        type=float,
+        default=None,
+        help='单股最大仓位比例（默认 0.30）'
+    )
+
+    parser.add_argument(
+        '--position',
+        choices=['add', 'list', 'remove', 'import', 'export', 'history', 'trades'],
+        help='持仓管理：add/list/remove/import/export/history/trades'
+    )
+    parser.add_argument(
+        'position_code',
+        nargs='?',
+        help='持仓股票代码（配合 --position 使用）'
+    )
+    parser.add_argument(
+        '--cost',
+        type=float,
+        default=None,
+        help='持仓成本价（仅 add 使用）'
+    )
+    parser.add_argument(
+        '--qty',
+        type=int,
+        default=None,
+        help='持仓数量（仅 add 使用）'
     )
     
     return parser.parse_args()
@@ -782,11 +997,160 @@ def main() -> int:
     for warning in warnings:
         logger.warning(warning)
     
+    # 资金管理模式
+    if args.capital:
+        db = get_db()
+        action = args.capital
+        
+        if action == 'status':
+            summary = db.get_portfolio_summary()
+            if summary.get('error'):
+                logger.warning(summary['error'])
+                logger.info("请先设置总资金：python main.py --capital set 500000")
+                return 2
+            
+            logger.info(f"总资金: {summary['total_capital']:.2f} 元")
+            logger.info(f"已投入: {summary['invested']:.2f} 元 ({summary['invested_ratio'] * 100:.1f}%)")
+            logger.info(f"可用资金: {summary['available']:.2f} 元")
+            logger.info(f"总风险敞口: {summary['total_risk_exposure']:.2f} 元")
+            logger.info(f"单笔风险比例: {summary['risk_per_trade']:.2%}")
+            logger.info(f"单股最大仓位: {summary['max_position_ratio']:.2%}")
+            
+            if summary['holdings']:
+                logger.info("持仓明细:")
+                for h in summary['holdings']:
+                    logger.info(
+                        f"- {h['code']}: 成本{h['cost_price']:.2f} "
+                        f"数量{h['quantity']} 市值{h['market_value']:.2f} "
+                        f"占比{h['position_ratio'] * 100:.1f}% "
+                        f"盈亏{h['profit_pct']:.2f}% "
+                        f"风险敞口{h['risk_exposure']:.2f}元"
+                    )
+            else:
+                logger.info("当前无持仓记录")
+            return 0
+        
+        if action == 'set':
+            amount = args.capital_amount
+            if amount is None and args.position_code:
+                # 兼容: --capital set 500000
+                try:
+                    amount = float(args.position_code)
+                except ValueError:
+                    amount = None
+            if amount is None or amount <= 0:
+                logger.error("请提供有效的总资金金额，例如：python main.py --capital set 500000")
+                return 2
+            
+            risk_per_trade = args.risk if args.risk is not None else 0.02
+            max_position_ratio = args.max_position if args.max_position is not None else 0.30
+            capital = db.set_capital(amount, risk_per_trade, max_position_ratio)
+            logger.info(
+                f"资金配置已更新: 总资金 {capital.total_capital:.2f} | "
+                f"单笔风险 {capital.risk_per_trade:.2%} | "
+                f"单股最大仓位 {capital.max_position_ratio:.2%}"
+            )
+            return 0
+    
+    # 持仓管理模式
+    if args.position:
+        db = get_db()
+        action = args.position
+        code = args.position_code
+        csv_path = os.path.join(os.path.dirname(__file__), 'positions.csv')
+        
+        if action == 'list':
+            positions = db.list_positions()
+            if not positions:
+                logger.info("当前无持仓记录")
+            else:
+                logger.info("当前持仓列表:")
+                for p in positions:
+                    logger.info(f"- {p.code}: 成本 {p.cost_price:.2f} | 数量 {p.quantity}")
+            return 0
+
+        if action == 'import':
+            if not os.path.exists(csv_path):
+                logger.error(f"未找到持仓文件: {csv_path}")
+                return 2
+            counters = _import_positions_from_csv(db, csv_path)
+            logger.info(
+                f"导入完成: 买入{counters['buy']} | "
+                f"卖出{counters['sell']} | 更新{counters['update']} | "
+                f"清仓{counters['remove']} | 无变化{counters['no_change']}"
+            )
+            return 0
+
+        if action == 'export':
+            positions = db.list_positions()
+            _export_positions_csv(csv_path, positions)
+            logger.info(f"已导出持仓到: {csv_path}")
+            return 0
+
+        if action == 'history':
+            if not code:
+                logger.error("请提供股票代码，例如：--position history 600519")
+                return 2
+            history = db.list_position_history(code)
+            if not history:
+                logger.info(f"未找到 {code} 的持仓历史")
+                return 0
+            logger.info(f"{code} 持仓历史:")
+            for h in history:
+                logger.info(
+                    f"- {h.date}: 数量 {h.quantity} | "
+                    f"收盘 {h.close_price:.2f} | "
+                    f"盈亏 {h.profit_loss:.2f} ({h.profit_pct:.2f}%)"
+                )
+            return 0
+
+        if action == 'trades':
+            logs = db.list_trade_logs(code=code)
+            if not logs:
+                logger.info("未找到交易记录")
+                return 0
+            logger.info("交易记录:")
+            for log in logs:
+                logger.info(
+                    f"- {log.trade_date} {log.action} {log.code} "
+                    f"{log.quantity} @ {log.price:.2f} "
+                    f"备注: {log.note or ''}"
+                )
+            return 0
+        
+        if not code:
+            logger.error("请提供持仓股票代码，例如：--position add 600519")
+            return 2
+        
+        if action == 'add':
+            if args.cost is None or args.qty is None:
+                logger.error("新增持仓需要提供 --cost 和 --qty")
+                return 2
+            if args.qty <= 0 or args.cost <= 0:
+                logger.error("持仓数量和成本价必须大于 0")
+                return 2
+            position = db.upsert_position(code, args.cost, args.qty)
+            logger.info(f"持仓已更新: {position.code} | 成本 {position.cost_price:.2f} | 数量 {position.quantity}")
+            return 0
+        
+        if action == 'remove':
+            removed = db.remove_position(code)
+            if removed:
+                logger.info(f"已删除持仓: {code}")
+                return 0
+            logger.warning(f"未找到持仓记录: {code}")
+            return 1
+    
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
+    elif args.use_positions:
+        db = get_db()
+        positions = db.list_positions()
+        stock_codes = [p.code for p in positions]
+        logger.info(f"使用持仓列表作为分析股票: {stock_codes}")
     
     try:
         # 模式1: 仅大盘复盘

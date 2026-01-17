@@ -73,6 +73,13 @@ class Config:
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     
+    # === 历史数据获取配置 ===
+    history_days: int = 120                   # 默认历史天数
+    history_days_extended: int = 250          # 扩展历史天数
+    history_batch_days: int = 90              # 分批拉取天数
+    history_batch_sleep_min: float = 2.0      # 分批请求间隔最小值
+    history_batch_sleep_max: float = 5.0      # 分批请求间隔最大值
+    
     # === 流控配置（防封禁关键参数）===
     # Akshare 请求间隔范围（秒）
     akshare_sleep_min: float = 2.0
@@ -160,6 +167,11 @@ class Config:
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            history_days=int(os.getenv('HISTORY_DAYS', '120')),
+            history_days_extended=int(os.getenv('HISTORY_DAYS_EXTENDED', '250')),
+            history_batch_days=int(os.getenv('HISTORY_BATCH_DAYS', '90')),
+            history_batch_sleep_min=float(os.getenv('HISTORY_BATCH_SLEEP_MIN', '2.0')),
+            history_batch_sleep_max=float(os.getenv('HISTORY_BATCH_SLEEP_MAX', '5.0')),
         )
     
     @classmethod

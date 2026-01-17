@@ -262,8 +262,9 @@ class AkshareFetcher(BaseFetcher):
         常见 ETF/LOF 代码前缀:
         - 51, 56, 58 (沪市 ETF)
         - 15, 16, 18 (深市 ETF/LOF)
+        - 52 (深市跨境/主题 ETF，如 520560)
         """
-        return code.startswith(('51', '56', '58', '15', '16', '18'))
+        return code.startswith(('51', '56', '58', '15', '16', '18', '52'))
 
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
@@ -527,6 +528,54 @@ class AkshareFetcher(BaseFetcher):
             
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
+            return None
+
+    def get_fund_flow(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取个股资金流向数据
+        """
+        import akshare as ak
+        
+        # ETF 通常不支持资金流向
+        if self.is_etf(stock_code):
+            logger.info(f"[{stock_code}] ETF 不支持资金流向，跳过")
+            return None
+        
+        market = "sh" if stock_code.startswith("6") else "sz"
+        
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            
+            logger.info(f"[API调用] ak.stock_individual_fund_flow(stock={stock_code}, market={market})")
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+            
+            if df is None or df.empty:
+                logger.warning(f"[API返回] 资金流向数据为空: {stock_code}")
+                return None
+            
+            latest = df.iloc[-1]
+            
+            def safe_float(val, default=0.0):
+                try:
+                    if pd.isna(val):
+                        return default
+                    return float(val)
+                except Exception:
+                    return default
+            
+            return {
+                'date': str(latest.get('日期', '')),
+                'main_net_inflow': safe_float(latest.get('主力净流入-净额')),
+                'main_inflow_ratio': safe_float(latest.get('主力净流入-净占比')),
+                'super_large_inflow': safe_float(latest.get('超大单净流入-净额')),
+                'large_inflow': safe_float(latest.get('大单净流入-净额')),
+                'medium_inflow': safe_float(latest.get('中单净流入-净额')),
+                'small_inflow': safe_float(latest.get('小单净流入-净额')),
+            }
+            
+        except Exception as e:
+            logger.warning(f"[API错误] 获取 {stock_code} 资金流向失败: {e}")
             return None
     
     def get_enhanced_data(self, stock_code: str, days: int = 60) -> Dict[str, Any]:

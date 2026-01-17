@@ -1,0 +1,1 @@
+nohup python3 main.py --use-positions --schedule > logs/scheduler.log 2>&1 &

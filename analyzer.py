@@ -65,6 +65,12 @@ class AnalysisResult:
     operation_advice: str  # 操作建议：买入/加仓/持有/减仓/卖出/观望
     confidence_level: str = "中"  # 置信度：高/中/低
     
+    # ========== 持仓与风控 ==========
+    has_position: bool = False
+    position_info: Optional[Dict[str, Any]] = None
+    capital_info: Optional[Dict[str, Any]] = None
+    risk_management: Optional[Dict[str, Any]] = None
+    
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
     
@@ -107,6 +113,10 @@ class AnalysisResult:
         return {
             'code': self.code,
             'name': self.name,
+            'has_position': self.has_position,
+            'position_info': self.position_info,
+            'capital_info': self.capital_info,
+            'risk_management': self.risk_management,
             'sentiment_score': self.sentiment_score,
             'trend_prediction': self.trend_prediction,
             'operation_advice': self.operation_advice,
@@ -779,6 +789,10 @@ class GeminiAnalyzer:
             
             # 解析响应
             result = self._parse_response(response_text, code, name)
+            result.has_position = bool(context.get('is_holding', False))
+            result.position_info = context.get('position')
+            result.capital_info = context.get('capital')
+            result.risk_management = context.get('risk_management')
             result.raw_response = response_text
             result.search_performed = bool(news_context)
             
@@ -926,6 +940,98 @@ class GeminiAnalyzer:
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
         
+        # 添加持仓信息（个性化建议依据）
+        if context.get('is_holding') and context.get('position'):
+            pos = context['position']
+            prompt += f"""
+---
+
+## 💼 持仓信息（已持仓）
+| 项目 | 数值 |
+|------|------|
+| 成本价 | {pos.get('cost_price', 'N/A')} 元 |
+| 持仓数量 | {pos.get('quantity', 'N/A')} 股 |
+| 当前市值 | {self._format_amount(pos.get('market_value'))} |
+| 浮动盈亏 | {pos.get('profit_loss', 'N/A')} 元 |
+| 盈亏比例 | {pos.get('profit_pct', 'N/A')}% |
+| 持仓占比 | {pos.get('position_ratio', 'N/A')} |
+| 风险敞口 | {pos.get('risk_exposure', 'N/A')} 元 |
+"""
+        else:
+            prompt += """
+---
+
+## 💼 持仓信息
+当前为空仓（未持有该股票）
+"""
+
+        # 添加资金配置
+        if context.get('capital'):
+            cap = context['capital']
+            prompt += f"""
+---
+
+## 💰 资金配置
+| 项目 | 数值 |
+|------|------|
+| 总资金 | {self._format_amount(cap.get('total_capital'))} |
+| 单笔风险比例 | {cap.get('risk_per_trade', 'N/A')} |
+| 单股最大仓位 | {cap.get('max_position_ratio', 'N/A')} |
+"""
+
+        # 添加风险管理建议
+        if context.get('risk_management'):
+            rm = context['risk_management']
+            stop_loss = rm.get('stop_loss', {})
+            pos_size = rm.get('position_sizing', {})
+            prompt += f"""
+---
+
+## 🛡️ 风险管理建议
+### 止损参考位
+- ATR止损（基于成本/现价）：{stop_loss.get('cost_atr_stop', stop_loss.get('current_atr_stop', 'N/A'))}
+- 保本止损：{stop_loss.get('breakeven_stop', 'N/A')}
+- MA10止损：{stop_loss.get('ma10_stop', 'N/A')}
+- MA20止损：{stop_loss.get('ma20_stop', 'N/A')}
+- 移动止损：{stop_loss.get('trailing_stop', 'N/A')}
+
+### 仓位建议
+- 建议买入股数：{pos_size.get('suggested_shares', 'N/A')}
+- 建议资金占用：{self._format_amount(pos_size.get('suggested_amount')) if pos_size else 'N/A'}
+- 建议仓位比例：{pos_size.get('position_ratio', 'N/A')}
+- 预估最大亏损：{pos_size.get('max_loss', 'N/A')} 元
+"""
+
+        # 添加持仓历史参考
+        if context.get('position_history'):
+            hist = context['position_history']
+            prompt += f"""
+---
+
+## 📆 持仓历史参考
+- 建仓日期: {hist.get('first_buy_date', 'N/A')}
+- 持仓天数: {hist.get('holding_days', 'N/A')} 天
+- 期间最高浮盈: {hist.get('max_profit_pct', 'N/A')}%
+- 期间最大回撤: {hist.get('max_drawdown', 'N/A')}%
+"""
+
+        # 添加资金流向
+        if context.get('fund_flow'):
+            flow = context['fund_flow']
+            prompt += f"""
+---
+
+## 💧 资金流向（主力）
+| 指标 | 数值 |
+|------|------|
+| 主力净流入 | {flow.get('main_net_inflow', 'N/A')} 元 |
+| 主力净占比 | {flow.get('main_inflow_ratio', 'N/A')}% |
+| 超大单净流入 | {flow.get('super_large_inflow', 'N/A')} 元 |
+| 大单净流入 | {flow.get('large_inflow', 'N/A')} 元 |
+| 中单净流入 | {flow.get('medium_inflow', 'N/A')} 元 |
+| 小单净流入 | {flow.get('small_inflow', 'N/A')} 元 |
+"""
+        
         # 添加新闻搜索结果（重点区域）
         prompt += """
 ---
@@ -962,6 +1068,8 @@ class GeminiAnalyzer:
 3. ❓ 量能是否配合（缩量回调/放量突破）？
 4. ❓ 筹码结构是否健康？
 5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+6. ❓ 如果已持仓：给出止损位/减仓位/加仓位建议；如果未持仓：给出建仓区间与初始仓位建议
+7. ❓ 如果有资金配置：基于总资金和单笔风险比例给出建议仓位
 
 ### 决策仪表盘要求：
 - **核心结论**：一句话说清该买/该卖/该等
