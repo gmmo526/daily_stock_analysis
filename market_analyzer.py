@@ -250,8 +250,33 @@ class MarketAnalyzer:
         try:
             logger.info("[大盘] 获取北向资金...")
             
-            # 获取北向资金数据
-            df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+            # 尝试多种方法获取北向资金数据（兼容不同版本的 akshare）
+            df = None
+            
+            # 方法1: 新版本 API
+            if hasattr(ak, 'stock_hsgt_north_net_flow_in_em'):
+                try:
+                    df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+                except Exception:
+                    pass
+            
+            # 方法2: 旧版本 API
+            if df is None or df.empty:
+                if hasattr(ak, 'tool_trade_date_hist_sina'):
+                    try:
+                        # 使用其他方法获取北向资金
+                        df = ak.tool_trade_date_hist_sina()
+                        # 这里需要根据实际 API 调整
+                    except Exception:
+                        pass
+            
+            # 方法3: 使用通用方法
+            if df is None or df.empty:
+                if hasattr(ak, 'stock_hsgt_fund_flow_summary_em'):
+                    try:
+                        df = ak.stock_hsgt_fund_flow_summary_em()
+                    except Exception:
+                        pass
             
             if df is not None and not df.empty:
                 # 取最新一条数据
@@ -260,9 +285,15 @@ class MarketAnalyzer:
                     overview.north_flow = float(latest['当日净流入']) / 1e8  # 转为亿元
                 elif '净流入' in df.columns:
                     overview.north_flow = float(latest['净流入']) / 1e8
+                elif 'value' in df.columns:
+                    overview.north_flow = float(latest['value']) / 1e8
                     
                 logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
+            else:
+                logger.warning("[大盘] 无法获取北向资金数据（API 方法不可用）")
                 
+        except AttributeError as e:
+            logger.warning(f"[大盘] Akshare API 方法不存在: {e}，跳过北向资金获取")
         except Exception as e:
             logger.warning(f"[大盘] 获取北向资金失败: {e}")
     

@@ -28,25 +28,40 @@ class NotificationService:
     
     职责：
     1. 生成 Markdown 格式的分析日报
-    2. 推送消息到企业微信机器人
+    2. 推送消息到企业微信/飞书机器人
     3. 支持本地保存日报
     """
     
-    def __init__(self, webhook_url: Optional[str] = None):
+    def __init__(self, webhook_url: Optional[str] = None, feishu_webhook_url: Optional[str] = None):
         """
         初始化通知服务
         
         Args:
             webhook_url: 企业微信 Webhook URL（可选，默认从配置读取）
+            feishu_webhook_url: 飞书 Webhook URL（可选，默认从配置读取）
         """
-        self._webhook_url = webhook_url or get_config().wechat_webhook_url
+        config = get_config()
+        self._webhook_url = webhook_url or config.wechat_webhook_url
+        self._feishu_webhook_url = feishu_webhook_url or config.feishu_webhook_url
         
-        if not self._webhook_url:
-            logger.warning("企业微信 Webhook URL 未配置，将不发送推送通知")
+        if not self._webhook_url and not self._feishu_webhook_url:
+            logger.warning("企业微信和飞书 Webhook URL 均未配置，将不发送推送通知")
+        elif self._feishu_webhook_url:
+            logger.info("已配置飞书 Webhook，将推送到飞书群机器人")
+        elif self._webhook_url:
+            logger.info("已配置企业微信 Webhook，将推送到企业微信")
     
     def is_available(self) -> bool:
         """检查通知服务是否可用"""
-        return bool(self._webhook_url)
+        return bool(self._webhook_url) or bool(self._feishu_webhook_url)
+    
+    def _get_notification_type(self) -> str:
+        """获取当前使用的通知类型"""
+        if self._feishu_webhook_url:
+            return "飞书"
+        elif self._webhook_url:
+            return "企业微信"
+        return "未知"
     
     def generate_daily_report(
         self, 
@@ -668,20 +683,25 @@ class NotificationService:
         2. 逐条发送个股信息
         """
         if not self.is_available():
-            logger.warning("企业微信未配置，跳过推送")
+            notification_type = self._get_notification_type()
+            logger.warning(f"{notification_type}未配置，跳过推送")
             return
+
+        notification_type = self._get_notification_type()
+        logger.info(f"开始推送{notification_type}通知（分条独立发送）...")
 
         # 1. 发送汇总
         summary_msg = self.format_wechat_summary(results)
         self.send_to_wechat(summary_msg)
         
-        # 1.5 发送汇总图片表格
-        image_path = self.generate_summary_image(results)
-        if image_path:
-            self.send_image_to_wechat(image_path)
-            # 稍作停顿确保图片先到
-            import time
-            time.sleep(2)
+        # 1.5 发送汇总图片表格（仅企业微信支持，飞书暂时跳过）
+        if self._webhook_url:  # 只有企业微信支持图片
+            image_path = self.generate_summary_image(results)
+            if image_path:
+                self.send_image_to_wechat(image_path)
+                # 稍作停顿确保图片先到
+                import time
+                time.sleep(2)
         
         # 2. 逐个发送个股（按评分从高到低）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
@@ -695,7 +715,7 @@ class NotificationService:
             logger.info(f"正在推送 {result.name} ({i+1}/{len(results)}) ...")
             self.send_to_wechat(msg)
             
-        logger.info("所有个股通知推送完成")
+        logger.info(f"所有个股通知推送完成（{notification_type}）")
     
     def generate_wechat_summary(self, results: List[AnalysisResult]) -> str:
         """
@@ -768,7 +788,30 @@ class NotificationService:
     
     def send_to_wechat(self, content: str) -> bool:
         """
-        推送消息到企业微信机器人
+        推送消息到企业微信/飞书机器人
+        
+        自动检测配置的 Webhook 类型并发送到对应平台
+        
+        Args:
+            content: Markdown 格式的消息内容
+            
+        Returns:
+            是否全部发送成功
+        """
+        if not self.is_available():
+            logger.warning("Webhook 未配置，跳过推送")
+            return False
+        
+        # 优先使用飞书（如果配置了）
+        if self._feishu_webhook_url:
+            return self.send_to_feishu(content)
+        elif self._webhook_url:
+            return self._send_to_wechat_internal(content)
+        return False
+    
+    def _send_to_wechat_internal(self, content: str) -> bool:
+        """
+        推送消息到企业微信机器人（内部方法）
         
         企业微信 Webhook 消息格式：
         {
@@ -787,9 +830,6 @@ class NotificationService:
         Returns:
             是否全部发送成功
         """
-        if not self.is_available():
-            logger.warning("企业微信 Webhook 未配置，跳过推送")
-            return False
         
         # 长度限制（字节数）
         # 这里的 4096 是官方限制，为了安全起见，我们使用 2048 字节作为分块目标
@@ -877,7 +917,15 @@ class NotificationService:
         return success_count == total_chunks
 
     def _send_single_message(self, content: str) -> bool:
-        """发送单条消息"""
+        """发送单条消息（根据配置自动选择平台）"""
+        if self._feishu_webhook_url:
+            return self._send_single_feishu_message(content)
+        elif self._webhook_url:
+            return self._send_single_wechat_message(content)
+        return False
+    
+    def _send_single_wechat_message(self, content: str) -> bool:
+        """发送单条企业微信消息"""
         payload = {
             "msgtype": "markdown",
             "markdown": {
@@ -898,6 +946,169 @@ class NotificationService:
                 return True
             else:
                 logger.error(f"企业微信返回错误: {result}")
+            return False
+        return False
+    
+    def send_to_feishu(self, content: str) -> bool:
+        """
+        推送消息到飞书群机器人
+        
+        飞书 Webhook 消息格式：
+        {
+            "msg_type": "text",
+            "content": {
+                "text": "文本内容"
+            }
+        }
+        
+        或者使用富文本卡片（支持 Markdown）：
+        {
+            "msg_type": "interactive",
+            "card": {
+                "config": {
+                    "wide_screen_mode": true
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": "Markdown 内容"
+                        }
+                    }
+                ]
+            }
+        }
+        
+        注意：飞书文本消息限制 4096 字符
+        处理策略：如果超长，自动分割成多条发送
+        
+        Args:
+            content: Markdown 格式的消息内容
+            
+        Returns:
+            是否全部发送成功
+        """
+        if not self._feishu_webhook_url:
+            logger.warning("飞书 Webhook 未配置，跳过推送")
+            return False
+        
+        # 飞书文本消息限制 4096 字符（不是字节）
+        MAX_CHAR_LENGTH = 4000  # 留一些余量
+        
+        if len(content) <= MAX_CHAR_LENGTH:
+            try:
+                return self._send_single_feishu_message(content)
+            except Exception as e:
+                logger.error(f"发送飞书消息失败: {e}")
+                return False
+        
+        # 内容过长，进行分割
+        logger.info(f"消息内容超长({len(content)}字符)，将分割成多条发送")
+        
+        chunks = []
+        current_chunk_lines = []
+        current_chunk_size = 0
+        
+        lines = content.split('\n')
+        
+        for line in lines:
+            line_size = len(line) + 1  # 加换行符
+            
+            if line_size > MAX_CHAR_LENGTH:
+                # 单行超长，按字符切分
+                if current_chunk_lines:
+                    chunks.append("\n".join(current_chunk_lines))
+                    current_chunk_lines = []
+                    current_chunk_size = 0
+                
+                char_limit = MAX_CHAR_LENGTH - 10
+                for j in range(0, len(line), char_limit):
+                    chunks.append(line[j:j+char_limit])
+                continue
+            
+            if current_chunk_size + line_size > MAX_CHAR_LENGTH:
+                chunks.append("\n".join(current_chunk_lines))
+                current_chunk_lines = [line]
+                current_chunk_size = line_size
+            else:
+                current_chunk_lines.append(line)
+                current_chunk_size += line_size
+        
+        if current_chunk_lines:
+            chunks.append("\n".join(current_chunk_lines))
+        
+        # 发送所有块
+        success_count = 0
+        total_chunks = len(chunks)
+        
+        for i, chunk in enumerate(chunks):
+            if total_chunks > 1:
+                paginated_content = f"({i+1}/{total_chunks})\n{chunk}"
+            else:
+                paginated_content = chunk
+            
+            if len(paginated_content) > MAX_CHAR_LENGTH:
+                logger.warning(f"分块 {i+1} 加上页码后仍超长，尝试截断")
+                paginated_content = paginated_content[:3900] + "\n...(已截断)"
+            
+            try:
+                if self._send_single_feishu_message(paginated_content):
+                    success_count += 1
+                import time
+                time.sleep(0.5)  # 避免触发频率限制
+            except Exception as e:
+                logger.error(f"发送第 {i+1} 条飞书消息失败: {e}")
+        
+        return success_count == total_chunks
+    
+    def _send_single_feishu_message(self, content: str) -> bool:
+        """
+        发送单条飞书消息
+        
+        使用富文本卡片格式，支持 Markdown 渲染
+        """
+        # 飞书富文本卡片格式（支持 Markdown）
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {
+                    "wide_screen_mode": True,
+                    "enable_forward": True
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": content
+                        }
+                    }
+                ]
+            }
+        }
+        
+        try:
+            response = requests.post(
+                self._feishu_webhook_url,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                # 飞书成功返回 {"code": 0} 或 {"StatusCode": 0}
+                if result.get('code') == 0 or result.get('StatusCode') == 0:
+                    logger.info("飞书消息发送成功")
+                    return True
+                else:
+                    logger.error(f"飞书返回错误: {result}")
+                    return False
+            else:
+                logger.error(f"飞书请求失败: {response.status_code}, {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"发送飞书消息异常: {e}")
             return False
             
 

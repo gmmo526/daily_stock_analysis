@@ -24,11 +24,17 @@ A股自选股智能分析系统 - 主调度程序
 import os
 
 # 代理配置 - 仅在本地环境使用，GitHub Actions 不需要
+# 优先从环境变量读取，如果没有配置则跳过（不强制使用代理）
 if os.getenv("GITHUB_ACTIONS") != "true":
-    # 本地开发环境，如需代理请取消注释或修改端口
-    os.environ["http_proxy"] = "http://127.0.0.1:7890"
-    os.environ["https_proxy"] = "http://127.0.0.1:7890"
-    pass
+    # 从环境变量读取代理配置，如果未设置则不使用代理
+    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    
+    if http_proxy:
+        os.environ["http_proxy"] = http_proxy
+    if https_proxy:
+        os.environ["https_proxy"] = https_proxy
+    # 如果都没有配置，则不设置代理，直接连接（适用于国内网络环境）
 
 import argparse
 import logging
@@ -574,12 +580,13 @@ class StockAnalysisPipeline:
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
             
-            # 推送到企业微信（使用分条发送模式）
+            # 推送到企业微信/飞书（使用分条发送模式）
             if self.notifier.is_available():
-                logger.info("开始推送企业微信通知（分条独立发送）...")
+                notification_type = self.notifier._get_notification_type()
+                logger.info(f"开始推送{notification_type}通知（分条独立发送）...")
                 self.notifier.send_batch_notifications(results)
             else:
-                logger.info("企业微信未配置，跳过推送")
+                logger.info("企业微信/飞书未配置，跳过推送")
                 
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
@@ -678,18 +685,20 @@ def run_market_review(notifier: NotificationService, analyzer=None, search_servi
         review_report = market_analyzer.run_daily_review()
         
         if review_report:
-            # 推送到微信
+            # 推送到企业微信/飞书
             if notifier.is_available():
                 # 添加标题
-                wechat_report = f"## 🎯 大盘复盘\n\n{review_report}"
-                if len(wechat_report) > 3800:
-                    wechat_report = wechat_report[:3800] + "\n...(已截断)"
+                report_content = f"## 🎯 大盘复盘\n\n{review_report}"
+                # 飞书限制 4000 字符，企业微信限制 4096 字节
+                if len(report_content) > 3800:
+                    report_content = report_content[:3800] + "\n...(已截断)"
                 
-                success = notifier.send_to_wechat(wechat_report)
+                success = notifier.send_to_wechat(report_content)
+                notification_type = notifier._get_notification_type()
                 if success:
-                    logger.info("大盘复盘推送成功")
+                    logger.info(f"大盘复盘推送成功（{notification_type}）")
                 else:
-                    logger.warning("大盘复盘推送失败")
+                    logger.warning(f"大盘复盘推送失败（{notification_type}）")
             
             return review_report
         
@@ -783,7 +792,10 @@ def main() -> int:
         # 模式1: 仅大盘复盘
         if args.market_review:
             logger.info("模式: 仅大盘复盘")
-            notifier = NotificationService(config.wechat_webhook_url)
+            notifier = NotificationService(
+                webhook_url=config.wechat_webhook_url,
+                feishu_webhook_url=config.feishu_webhook_url
+            )
             
             # 初始化搜索服务和分析器（如果有配置）
             search_service = None

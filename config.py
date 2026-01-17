@@ -55,6 +55,7 @@ class Config:
     
     # === 通知配置 ===
     wechat_webhook_url: Optional[str] = None
+    feishu_webhook_url: Optional[str] = None  # 飞书群机器人 Webhook URL
     
     # === 数据库配置 ===
     database_path: str = "./data/stock_analysis.db"
@@ -150,6 +151,7 @@ class Config:
             tavily_api_keys=tavily_api_keys,
             serpapi_keys=serpapi_keys,
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
+            feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
@@ -188,8 +190,10 @@ class Config:
         if not self.tavily_api_keys and not self.serpapi_keys:
             warnings.append("提示：未配置搜索引擎 API Key (Tavily/SerpAPI)，新闻搜索功能将不可用")
         
-        if not self.wechat_webhook_url:
-            warnings.append("提示：未配置企业微信 Webhook，将不发送推送通知")
+        if not self.wechat_webhook_url and not self.feishu_webhook_url:
+            warnings.append("提示：未配置企业微信或飞书 Webhook，将不发送推送通知")
+        elif self.feishu_webhook_url and not self.wechat_webhook_url:
+            warnings.append("提示：已配置飞书 Webhook，将推送到飞书")
         
         return warnings
     
